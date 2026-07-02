@@ -1,13 +1,7 @@
 name: Build and Push HRMS
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
-
-concurrency:
-  group: hrms-build-${{ github.ref }}
-  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -21,6 +15,7 @@ env:
 
 jobs:
   build-and-push:
+    if: github.ref == 'refs/heads/main'
     name: Build and push image
     runs-on: ubuntu-latest
     timeout-minutes: 30
