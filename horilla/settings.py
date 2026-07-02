@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/4.1/ref/settings/
 """
 
 import os
+from datetime import timedelta
 from os.path import join
 from pathlib import Path
 
@@ -183,6 +184,31 @@ STATICFILES_STORAGE = "whitenoise.storage.CompressedStaticFilesStorage"
 
 MEDIA_URL = "/media/"
 MEDIA_ROOT = os.path.join(BASE_DIR, "media/")
+
+# Store user uploads in Google Cloud Storage when a bucket is configured.
+# Authentication uses Application Default Credentials from the VM service
+# account; no service-account key is stored in the image or on disk.
+if env("GS_BUCKET_NAME", default=None):
+    GS_BUCKET_NAME = env("GS_BUCKET_NAME")
+    GS_PROJECT_ID = env("GOOGLE_CLOUD_PROJECT", default=None)
+    GS_QUERYSTRING_AUTH = env.bool("GS_QUERYSTRING_AUTH", default=True)
+    GS_EXPIRATION = timedelta(
+        seconds=env.int("GS_SIGNED_URL_EXPIRATION", default=3600)
+    )
+    GS_IAM_SIGN_BLOB = env.bool("GS_IAM_SIGN_BLOB", default=True)
+    GS_SA_EMAIL = env("GS_SA_EMAIL")
+    DEFAULT_FILE_STORAGE = "horilla.horilla_backends_gcp.PrivateMediaStorage"
+    STORAGES = {
+        "default": {
+            "BACKEND": DEFAULT_FILE_STORAGE,
+        },
+        "staticfiles": {
+            "BACKEND": "whitenoise.storage.CompressedStaticFilesStorage",
+        },
+    }
+    if "storages" not in INSTALLED_APPS:
+        INSTALLED_APPS.append("storages")
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.1/ref/settings/#default-auto-field
 

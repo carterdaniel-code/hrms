@@ -1,39 +1,67 @@
+name: hrms
+
 services:
   server:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    ports:
-      - 8000:8000
+    image: ${HRMS_IMAGE:?HRMS_IMAGE must be set}
     restart: unless-stopped
+    init: true
+    env_file:
+      - .env
     environment:
-      DATABASE_URL: "postgres://postgres:postgres@db:5432/horilla"
-    command: sh ./entrypoint.sh
+      DEBUG: "False"
+      DB_ENGINE: django.db.backends.postgresql
+      DB_NAME: ${POSTGRES_DB}
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_HOST: db
+      DB_PORT: "5432"
+    ports:
+      - "8000:8000"
     volumes:
-      - ./horilla:/app/horilla
-      - ./media:/app/media
+      - /mnt/hrms/static:/app/staticfiles
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=5)"
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
 
   db:
-    image: postgres:16-bullseye
+    image: postgres:16.4-bullseye
+    restart: unless-stopped
+    shm_size: 256mb
     environment:
-      POSTGRES_DB: horilla
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
       POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
       PGDATA: /var/lib/postgresql/data/pgdata
-    ports:
-      - 5432:5432
-    restart: unless-stopped
     volumes:
-      - horilla-data:/var/lib/postgresql/data
+      - /mnt/hrms/postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres"]
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 10s
       timeout: 5s
-      retries: 5
-
-volumes:
-  horilla-data:
+      retries: 10
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"

@@ -1,0 +1,217 @@
+name: Deploy HRMS to VM
+
+on:
+  workflow_run:
+    workflows: ["Build and Push HRMS"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Image tag to deploy (normally a full commit SHA)
+        required: true
+        type: string
+
+concurrency:
+  group: hrms-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: ${{ secrets.PROD_PROJECT_ID }}
+  REGION: ${{ secrets.PROD_ARTIFACT_REGISTRY_REGION }}
+  REPOSITORY: ${{ secrets.PROD_ARTIFACT_REPO }}
+  VM_NAME: ${{ secrets.PROD_VM_NAME }}
+  VM_ZONE: ${{ secrets.PROD_ZONE }}
+  VM_SSH_USER: ${{ secrets.PROD_VM_SSH_USER }}
+  APP_DIR: /opt/hrms
+  DATA_DIR: /mnt/hrms
+
+jobs:
+  deploy:
+    name: Deploy production
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+
+    steps:
+      - name: Resolve revision
+        id: revision
+        shell: bash
+        env:
+          MANUAL_TAG: ${{ inputs.image_tag }}
+          BUILT_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -Eeuo pipefail
+          tag="${MANUAL_TAG:-$BUILT_SHA}"
+          if [[ ! "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::Invalid Docker image tag"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check out deployed revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.PROD_APP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.PROD_GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Validate required configuration
+        shell: bash
+        env:
+          DB_NAME: ${{ secrets.PROD_DB_NAME }}
+          DB_USER: ${{ secrets.PROD_DB_USER }}
+          DB_PASSWORD: ${{ secrets.PROD_DB_PASSWORD }}
+          SECRET_KEY: ${{ secrets.PROD_DJANGO_SECRET_KEY }}
+          ALLOWED_HOSTS: ${{ vars.PROD_ALLOWED_HOSTS }}
+          CSRF_TRUSTED_ORIGINS: ${{ vars.PROD_CSRF_TRUSTED_ORIGINS }}
+          GS_BUCKET_NAME: ${{ vars.PROD_GCS_MEDIA_BUCKET }}
+          GS_SA_EMAIL: ${{ vars.PROD_GCS_SIGNER_SERVICE_ACCOUNT }}
+        run: |
+          set -Eeuo pipefail
+          for name in DB_NAME DB_USER DB_PASSWORD SECRET_KEY ALLOWED_HOSTS CSRF_TRUSTED_ORIGINS GS_BUCKET_NAME GS_SA_EMAIL; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::$name is not configured"
+              exit 1
+            fi
+          done
+
+      - name: Prepare VM directories
+        run: |
+          gcloud compute ssh "${VM_SSH_USER}@${VM_NAME}" \
+            --zone="${VM_ZONE}" \
+            --project="${PROJECT_ID}" \
+            --command="sudo install -d -m 0755 -o '${VM_SSH_USER}' -g '${VM_SSH_USER}' '${APP_DIR}' '${DATA_DIR}' '${DATA_DIR}/static' && sudo install -d -m 0700 -o 999 -g 999 '${DATA_DIR}/postgres'"
+
+      - name: Copy Compose definition
+        run: |
+          gcloud compute scp docker-compose.yaml \
+            "${VM_SSH_USER}@${VM_NAME}:${APP_DIR}/docker-compose.yaml" \
+            --zone="${VM_ZONE}" \
+            --project="${PROJECT_ID}" \
+            --quiet
+
+      - name: Write protected runtime configuration
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ steps.revision.outputs.tag }}
+          DB_NAME: ${{ secrets.PROD_DB_NAME }}
+          DB_USER: ${{ secrets.PROD_DB_USER }}
+          DB_PASSWORD: ${{ secrets.PROD_DB_PASSWORD }}
+          SECRET_KEY: ${{ secrets.PROD_DJANGO_SECRET_KEY }}
+          DB_INIT_PASSWORD: ${{ secrets.PROD_DB_INIT_PASSWORD }}
+          ALLOWED_HOSTS: ${{ vars.PROD_ALLOWED_HOSTS }}
+          CSRF_TRUSTED_ORIGINS: ${{ vars.PROD_CSRF_TRUSTED_ORIGINS }}
+          GS_BUCKET_NAME: ${{ vars.PROD_GCS_MEDIA_BUCKET }}
+          GCS_MEDIA_PREFIX: ${{ vars.PROD_GCS_MEDIA_PREFIX }}
+          GS_SA_EMAIL: ${{ vars.PROD_GCS_SIGNER_SERVICE_ACCOUNT }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          env_file="$(mktemp)"
+
+          write_env() {
+            local key="$1"
+            local value="$2"
+            if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+              echo "::error::$key must not contain a newline"
+              exit 1
+            fi
+            value="${value//\\/\\\\}"
+            value="${value//\"/\\\"}"
+            value="${value//\$/\$\$}"
+            printf '%s=\"%s\"\n' "$key" "$value"
+          }
+
+          {
+            write_env HRMS_IMAGE "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/hrms:${IMAGE_TAG}"
+            write_env POSTGRES_DB "$DB_NAME"
+            write_env POSTGRES_USER "$DB_USER"
+            write_env POSTGRES_PASSWORD "$DB_PASSWORD"
+            write_env SECRET_KEY "$SECRET_KEY"
+            write_env DB_INIT_PASSWORD "${DB_INIT_PASSWORD:-}"
+            write_env ALLOWED_HOSTS "$ALLOWED_HOSTS"
+            write_env CSRF_TRUSTED_ORIGINS "$CSRF_TRUSTED_ORIGINS"
+            write_env TIME_ZONE Asia/Kolkata
+            write_env GOOGLE_CLOUD_PROJECT "$PROJECT_ID"
+            write_env GS_BUCKET_NAME "$GS_BUCKET_NAME"
+            write_env GCS_MEDIA_PREFIX "${GCS_MEDIA_PREFIX:-media}"
+            write_env GS_QUERYSTRING_AUTH true
+            write_env GS_SIGNED_URL_EXPIRATION 3600
+            write_env GS_IAM_SIGN_BLOB true
+            write_env GS_SA_EMAIL "$GS_SA_EMAIL"
+          } > "$env_file"
+          gcloud compute scp "$env_file" \
+            "${VM_SSH_USER}@${VM_NAME}:${APP_DIR}/.env.new" \
+            --zone="${VM_ZONE}" \
+            --project="${PROJECT_ID}" \
+            --quiet
+          rm -f "$env_file"
+
+      - name: Pull and roll out
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          registry="${REGION}-docker.pkg.dev"
+          gcloud compute ssh "${VM_SSH_USER}@${VM_NAME}" \
+            --zone="${VM_ZONE}" \
+            --project="${PROJECT_ID}" \
+            --command="REGISTRY='${registry}' APP_DIR='${APP_DIR}' bash -s" <<'REMOTE'
+          set -Eeuo pipefail
+          cd "$APP_DIR"
+          chmod 0600 .env.new
+          mv .env.new .env
+
+          gcloud auth configure-docker "$REGISTRY" --quiet
+          docker compose config --quiet
+          previous_image="$(docker inspect --format '{{.Config.Image}}' hrms-server-1 2>/dev/null || true)"
+
+          rollback() {
+            exit_code=$?
+            echo "Deployment failed; collecting diagnostics."
+            docker compose ps || true
+            docker compose logs --no-color --tail=200 server db || true
+            if [ -n "$previous_image" ]; then
+              echo "Rolling application back to $previous_image"
+              HRMS_IMAGE="$previous_image" docker compose up \
+                -d --no-deps --force-recreate --wait --wait-timeout 180 server || true
+            else
+              echo "No previous application image is available for rollback."
+            fi
+            exit "$exit_code"
+          }
+          trap rollback ERR
+
+          docker compose pull server db
+          docker compose up -d --remove-orphans --wait --wait-timeout 180 db
+          docker compose up -d --no-deps --force-recreate --wait --wait-timeout 180 server
+          trap - ERR
+          docker compose ps
+          docker image prune -f --filter "until=168h"
+          REMOTE
+
+      - name: Show diagnostics on failure
+        if: failure()
+        run: |
+          gcloud compute ssh "${VM_SSH_USER}@${VM_NAME}" \
+            --zone="${VM_ZONE}" \
+            --project="${PROJECT_ID}" \
+            --command="cd '${APP_DIR}' && docker compose ps && docker compose logs --no-color --tail=200" \
+            || true
